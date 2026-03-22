@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoresearch-core"
+version = "0.1.0"
+description = "Generic evolution engine: Op/Delta, GRPO ranking, UCB strategy selection, health monitoring"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
