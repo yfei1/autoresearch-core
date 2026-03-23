@@ -41,7 +41,8 @@ class RankingResult:
 
 def build_diff_ranking_prompt(original: str, delta_diffs: dict[str, str],
                                constitution: str,
-                               domain_context: str = "content") -> tuple[str, dict, dict]:
+                               domain_context: str = "content",
+                               extra_context: str = "") -> tuple[str, dict, dict]:
     """Build a prompt asking a judge to rank candidate diffs.
 
     To prevent position bias, labels are shuffled.
@@ -53,6 +54,8 @@ def build_diff_ranking_prompt(original: str, delta_diffs: dict[str, str],
         domain_context: short description of what's being ranked
             (e.g., "Obsidian notes for ML interview preparation",
             "prompt templates for a financial research pipeline").
+        extra_context: optional additional context for judges (e.g.,
+            canonical note content for dedup evaluation).
 
     Returns:
         (prompt_text, label_map, reverse_map) where:
@@ -79,6 +82,8 @@ def build_diff_ranking_prompt(original: str, delta_diffs: dict[str, str],
     # Truncate original to avoid token overflow
     orig_truncated = original[:8000]
 
+    extra_context_section = f"\n{extra_context}\n" if extra_context else ""
+
     prompt = f"""You are a quality judge for {domain_context}.
 
 ## Constitution (quality criteria)
@@ -88,7 +93,7 @@ def build_diff_ranking_prompt(original: str, delta_diffs: dict[str, str],
 ```
 {orig_truncated}
 ```
-
+{extra_context_section}
 ## Candidates
 {candidates_text}
 
@@ -96,6 +101,11 @@ def build_diff_ranking_prompt(original: str, delta_diffs: dict[str, str],
 Rank ALL candidates from best to worst based on the constitution's quality criteria.
 The identity candidate (no changes) should rank highly only if none of the changes
 are genuine improvements.
+
+IMPORTANT: If a candidate's changes are primarily synonym substitutions, tense
+changes, or rephrasing with no new information, concrete numbers, or causal
+explanations ("because" chains) added, rank it BELOW identity. Rewording that
+changes tone but not clarity or density is not an improvement.
 
 Respond with ONLY valid JSON (no markdown fences):
 {{"ranking": ["{labels[0]}", "{labels[1]}", ...], "reasoning": "one sentence explaining the ranking"}}
@@ -109,16 +119,18 @@ The first element is the BEST candidate. Include ALL candidate labels."""
 # Parsing
 # ---------------------------------------------------------------------------
 
-def parse_ranking(output: str, reverse_map: dict) -> Optional[dict]:
+def parse_ranking(output: str | None, reverse_map: dict) -> Optional[dict]:
     """Parse judge output into {delta_id: rank}.
 
     Args:
-        output: raw LLM output.
+        output: raw LLM output (may be None on call failure).
         reverse_map: {display_label -> delta_id}.
 
     Returns:
         {delta_id: rank} (1-based) or None on parse failure.
     """
+    if output is None:
+        return None
     data = extract_json_object(output)
     if data is None:
         return None
@@ -206,7 +218,8 @@ def grpo_rank(original_content: str, deltas: list[Delta],
               constitution: str,
               judges: list,
               file_contents: dict[str, str] | None = None,
-              domain_context: str = "content") -> RankingResult:
+              domain_context: str = "content",
+              extra_context: str = "") -> RankingResult:
     """Run full GRPO ranking: generate diffs, query judges, aggregate.
 
     Args:
@@ -219,6 +232,8 @@ def grpo_rank(original_content: str, deltas: list[Delta],
             built from original_content using each delta's primary_target.
         domain_context: short description for the judge prompt
             (e.g., "Obsidian notes for ML interview preparation").
+        extra_context: optional additional context for judges (e.g.,
+            canonical note content for cross-file dedup evaluation).
 
     Returns:
         RankingResult with final rankings and advantages.
@@ -244,6 +259,7 @@ def grpo_rank(original_content: str, deltas: list[Delta],
         prompt, label_map, reverse_map = build_diff_ranking_prompt(
             original_content, delta_diffs, constitution,
             domain_context=domain_context,
+            extra_context=extra_context,
         )
 
         try:
