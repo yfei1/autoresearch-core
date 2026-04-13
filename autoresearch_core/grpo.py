@@ -32,6 +32,7 @@ class RankingResult:
     rankings: dict = field(default_factory=dict)         # delta_id -> final_rank (1-based)
     advantages: dict = field(default_factory=dict)       # delta_id -> advantage score
     per_judge: dict = field(default_factory=dict)        # judge.id -> {delta_id -> rank}
+    per_judge_reasoning: dict = field(default_factory=dict)  # judge.id -> reasoning string
     best_id: str = ""                                    # id of the top-ranked delta
 
 
@@ -102,13 +103,28 @@ Rank ALL candidates from best to worst based on the constitution's quality crite
 The identity candidate (no changes) should rank highly only if none of the changes
 are genuine improvements.
 
-IMPORTANT: If a candidate's changes are primarily synonym substitutions, tense
-changes, or rephrasing with no new information, concrete numbers, or causal
-explanations ("because" chains) added, rank it BELOW identity. Rewording that
-changes tone but not clarity or density is not an improvement.
+IMPORTANT: Rank a candidate BELOW identity if its changes are primarily:
+- Synonym substitutions or tense changes with no new information added
+- Clause reordering (moving a phrase from end to beginning of a sentence, or
+  splitting one sentence into two with the same words in different order)
+- Parenthetical shuffling (moving an existing definition from one position to
+  another without changing its content)
+- Adding an inline definition for a term that a reader with the target background
+  already knows (common ML terms, basic Python/PyTorch, common hardware terms,
+  "token", "GPU", "CPU", "neural net", etc.)
+- Adding an inline definition that already appears elsewhere in the note
+- Removing a sentence that serves as a **structural preview** — a sentence that
+  names two or more upcoming concepts (e.g. "Two cases: X before GPU init, Y
+  during forward pass") before a section that explains each in detail. Such
+  sentences carry no new facts but are load-bearing for progressive disclosure.
+  Removing them leaves subsequent paragraphs without context.
+Rewording that changes tone but not reader comprehension is NOT an improvement.
+Only rank a candidate above identity if it adds concrete information (numbers,
+causal chains), fixes a genuine jargon gap for the target reader, or restructures
+for clarity in a way that measurably improves progressive disclosure.
 
 Respond with ONLY valid JSON (no markdown fences):
-{{"ranking": ["{labels[0]}", "{labels[1]}", ...], "reasoning": "one sentence explaining the ranking"}}
+{{"ranking": ["{('", "'.join(labels))}"], "reasoning": "one sentence explaining the ranking"}}
 
 The first element is the BEST candidate. Include ALL candidate labels."""
 
@@ -119,15 +135,16 @@ The first element is the BEST candidate. Include ALL candidate labels."""
 # Parsing
 # ---------------------------------------------------------------------------
 
-def parse_ranking(output: str | None, reverse_map: dict) -> Optional[dict]:
-    """Parse judge output into {delta_id: rank}.
+def parse_ranking(output: str | None, reverse_map: dict) -> Optional[tuple[dict, str]]:
+    """Parse judge output into ({delta_id: rank}, reasoning_string).
 
     Args:
         output: raw LLM output (may be None on call failure).
         reverse_map: {display_label -> delta_id}.
 
     Returns:
-        {delta_id: rank} (1-based) or None on parse failure.
+        (rank_dict, reasoning) where rank_dict is {delta_id: rank} (1-based),
+        or None on parse failure.
     """
     if output is None:
         return None
@@ -149,7 +166,8 @@ def parse_ranking(output: str | None, reverse_map: dict) -> Optional[dict]:
     if len(result) < len(reverse_map):
         return None
 
-    return result
+    reasoning = data.get("reasoning", "")
+    return result, str(reasoning)
 
 
 # ---------------------------------------------------------------------------
@@ -268,13 +286,15 @@ def grpo_rank(original_content: str, deltas: list[Delta],
             print(f"  Judge {judge.id} failed: {e}", file=sys.stderr)
             continue
 
-        ranking = parse_ranking(output, reverse_map)
-        if ranking is None:
+        parsed = parse_ranking(output, reverse_map)
+        if parsed is None:
             print(f"  Judge {judge.id}: could not parse ranking", file=sys.stderr)
             continue
 
+        ranking, reasoning = parsed
         all_rankings.append(ranking)
         result.per_judge[judge.id] = ranking
+        result.per_judge_reasoning[judge.id] = reasoning
 
     if not all_rankings:
         # All judges failed — identity wins by default

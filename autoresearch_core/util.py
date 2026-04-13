@@ -64,15 +64,18 @@ def extract_json_array(output: str) -> list | None:
 def find_paragraph_overlaps(
     source_content: str,
     target_contents: dict[str, str],
-    threshold: float = 0.7,
+    threshold: float = 0.5,
     min_paragraph_len: int = 100,
 ) -> list[tuple[str, float, str, str]]:
     """Find paragraph-level word-set overlaps between source and target files.
 
+    Uses Jaccard similarity (intersection/union) instead of containment coefficient
+    to avoid false positives from shared domain vocabulary.
+
     Args:
         source_content: content of the file being checked.
         target_contents: {path: content} for files to compare against.
-        threshold: minimum word-set overlap ratio to flag (0-1).
+        threshold: minimum Jaccard similarity ratio to flag (0-1).
         min_paragraph_len: minimum paragraph length in chars.
 
     Returns:
@@ -88,8 +91,6 @@ def find_paragraph_overlaps(
     seen = set()
 
     for target_path, target_content in target_contents.items():
-        if target_path in seen:
-            continue
         target_sentences = re.split(r'[.!?]\s+', target_content)
 
         for para in paragraphs:
@@ -103,7 +104,7 @@ def find_paragraph_overlaps(
                 chunk_words = set(chunk.lower().split())
                 if len(chunk_words) < 10:
                     continue
-                ratio = len(para_words & chunk_words) / min(len(para_words), len(chunk_words))
+                ratio = len(para_words & chunk_words) / len(para_words | chunk_words)
                 if ratio > threshold:
                     overlaps.append((
                         target_path,
@@ -129,7 +130,7 @@ class Overlap:
 
 def detect_overlaps(
     file_contents: dict[str, str],
-    threshold: float = 0.7,
+    threshold: float = 0.5,
     min_paragraph_len: int = 100,
 ) -> list[Overlap]:
     """Detect paragraph-level content overlaps across all files.
@@ -157,3 +158,83 @@ def detect_overlaps(
 
     overlaps.sort(key=lambda o: o.overlap_ratio, reverse=True)
     return overlaps
+
+
+# ---------------------------------------------------------------------------
+# Intra-file overlap detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class IntraOverlap:
+    """A detected content overlap between two sections within the same file."""
+    path: str              # file containing the duplication
+    section_a: str         # header of first (earlier) section
+    section_b: str         # header of second (later) section
+    overlap_ratio: float   # 0-1
+    preview_a: str         # snippet from section_a that overlaps
+    preview_b: str         # snippet from section_b that overlaps
+
+
+def detect_intra_overlaps(
+    file_contents: dict[str, str],
+    threshold: float = 0.4,
+    min_section_len: int = 80,
+) -> list[IntraOverlap]:
+    """Detect section-level content overlaps within each file.
+
+    Uses Jaccard similarity (intersection/union) to avoid false positives
+    from shared domain vocabulary.
+    Splits each file into sections by ## headers and compares all pairs.
+    A later section that restates an earlier section is flagged.
+
+    Returns list of IntraOverlap sorted by overlap_ratio descending.
+    """
+    results: list[IntraOverlap] = []
+
+    for path, content in file_contents.items():
+        # Split into sections by ## headers
+        parts = re.split(r'^(## .+)$', content, flags=re.MULTILINE)
+        # parts alternates: [preamble, header1, body1, header2, body2, ...]
+        sections: list[tuple[str, str]] = []
+        for k in range(1, len(parts) - 1, 2):
+            header = parts[k].strip()
+            body = parts[k + 1].strip()
+            if len(body) >= min_section_len:
+                sections.append((header, body))
+
+        # Compare all pairs (i < j): check if section_j paragraphs overlap section_i
+        for i in range(len(sections)):
+            header_a, body_a = sections[i]
+            words_a = set(body_a.lower().split())
+            if len(words_a) < 15:
+                continue
+            for j in range(i + 1, len(sections)):
+                header_b, body_b = sections[j]
+                # Check each paragraph of section_b against section_a
+                paras_b = [p.strip() for p in re.split(r'\n\s*\n', body_b)
+                           if len(p.strip()) >= 40]
+                best_ratio = 0.0
+                best_preview_b = ""
+                for para in paras_b:
+                    para_words = set(para.lower().split())
+                    if len(para_words) < 8:
+                        continue
+                    ratio = len(para_words & words_a) / len(para_words | words_a)
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best_preview_b = para.replace('\n', ' ')[:150]
+
+                if best_ratio > threshold:
+                    # Find the matching snippet in section_a
+                    preview_a = body_a.replace('\n', ' ')[:150]
+                    results.append(IntraOverlap(
+                        path=path,
+                        section_a=header_a,
+                        section_b=header_b,
+                        overlap_ratio=best_ratio,
+                        preview_a=preview_a,
+                        preview_b=best_preview_b,
+                    ))
+
+    results.sort(key=lambda o: o.overlap_ratio, reverse=True)
+    return results

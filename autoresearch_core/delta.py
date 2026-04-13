@@ -46,17 +46,39 @@ class Op:
         edit_file   — search-replace edits on an existing file
         create_file — create a new file with given content
         append_file — append text to an existing file (e.g., reverse links)
+        delete_file — remove a file from the vault
+        rename_file — move a file to a new path (content preserved)
 
     Extensible: add new kinds by extending execute(). No loop changes needed.
     """
-    kind: str              # "edit_file", "create_file", "append_file"
+    kind: str              # "edit_file", "create_file", "append_file", "delete_file", "rename_file"
     path: str = ""         # target path relative to repo root
     edits: list[EditOp] = field(default_factory=list)    # for edit_file
     content: str = ""      # for create_file
     text: str = ""         # for append_file
+    # delete_file uses only path — no other fields needed
+    new_path: str = ""     # for rename_file (destination path)
 
-    def execute(self, current_content: str | None = None) -> tuple[str, str | None]:
-        """Execute this op. Returns (result_content, error). Dispatches by kind."""
+    def execute(self, current_content: str | None = None) -> tuple[str | None, str | None]:
+        """Execute this op. Returns (result_content, error). Dispatches by kind.
+
+        For delete_file, returns (None, None) — the None content signals deletion.
+        For rename_file, returns (content, None) — content is copied to new_path;
+            the caller must also delete the old path from file_contents.
+        """
+
+        if self.kind == "rename_file":
+            if current_content is None:
+                return None, f"Cannot rename non-existent file: {self.path}"
+            if not self.new_path.strip():
+                return None, "rename_file: new_path is empty"
+            # Return content unchanged — caller handles the move
+            return current_content, None
+
+        if self.kind == "delete_file":
+            if current_content is None:
+                return None, f"Cannot delete non-existent file: {self.path}"
+            return None, None  # sentinel: this file is deleted
 
         if self.kind == "create_file":
             if not self.content.strip():
@@ -103,6 +125,9 @@ class Op:
             d["content_length"] = len(self.content)
         elif self.kind == "append_file":
             d["text_length"] = len(self.text)
+        elif self.kind == "rename_file":
+            d["new_path"] = self.new_path
+        # delete_file has no extra fields
         return d
 
 
@@ -139,20 +164,35 @@ class Delta:
 
     def affected_paths(self) -> list[str]:
         """All unique file paths this delta touches, in order."""
-        return list(dict.fromkeys(op.path for op in self.ops if op.path))
+        paths = []
+        for op in self.ops:
+            if op.path:
+                paths.append(op.path)
+            if op.kind == "rename_file" and op.new_path:
+                paths.append(op.new_path)
+        return list(dict.fromkeys(paths))
 
-    def execute_all(self, file_contents: dict[str, str]) -> tuple[dict[str, str], str | None]:
+    def execute_all(self, file_contents: dict[str, str]) -> tuple[dict[str, str | None], str | None]:
         """Execute all ops atomically. Returns (new_contents, error).
 
         On error, returns original contents unchanged (all-or-nothing).
+        Values of None in the result indicate deleted files.
         """
-        results = dict(file_contents)
+        results: dict[str, str | None] = dict(file_contents)
         for op in self.ops:
             current = results.get(op.path)
+            # A deleted file (None) can be overwritten by create_file
+            if current is None and op.kind not in ("create_file", "delete_file", "rename_file"):
+                return file_contents, f"Cannot {op.kind} on deleted file: {op.path}"
             new_content, err = op.execute(current)
             if err:
                 return file_contents, err
-            results[op.path] = new_content
+            if op.kind == "rename_file":
+                # Copy content to new_path, delete old path
+                results[op.new_path] = new_content
+                results[op.path] = None  # mark old path as deleted
+            else:
+                results[op.path] = new_content
         return results, None
 
     def render_for_ranking(self, file_contents: dict[str, str]) -> str:
@@ -164,7 +204,11 @@ class Delta:
         parts = []
         for path in self.affected_paths():
             old = file_contents.get(path, "")
-            new = new_contents.get(path, "")
+            new = new_contents.get(path)
+            if new is None:
+                # File deleted
+                parts.append(f"--- DELETED: {path} ---\n(file removed from vault)")
+                continue
             if old != new:
                 diff_lines = list(difflib.unified_diff(
                     old.splitlines(keepends=True),

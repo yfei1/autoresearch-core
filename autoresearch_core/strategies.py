@@ -41,7 +41,9 @@ Output ONLY valid JSON:
 {"ops": [
   {"kind": "edit_file", "path": "<file>", "search": "<exact text>", "replace": "<new text>"},
   {"kind": "create_file", "path": "<file>", "content": "<full file content>"},
-  {"kind": "append_file", "path": "<file>", "text": "<text to append>"}
+  {"kind": "append_file", "path": "<file>", "text": "<text to append>"},
+  {"kind": "delete_file", "path": "<file to remove>"},
+  {"kind": "rename_file", "path": "<old file>", "new_path": "<new file>"}
 ]}
 
 RULES:
@@ -50,6 +52,10 @@ RULES:
 - "replace" CANNOT be empty
 - "path" must be relative to repo root
 - For single-file edits, use only edit_file ops
+- delete_file removes a file from the vault. Only use when merging content into
+  another note — the content must land somewhere first (Priority 2: no net info loss).
+  Before delete_file, use edit_file on all notes that reference the deleted file
+  to update their wikilinks.
 """
 
 
@@ -202,6 +208,13 @@ def parse_ops(output: str, default_path: str) -> Optional[list[Op]]:
             text = raw.get("text", "")
             if text:
                 raw_parsed.append(("append_file", path, text))
+        elif kind == "delete_file":
+            if path:
+                raw_parsed.append(("delete_file", path, None))
+        elif kind == "rename_file":
+            new_path = raw.get("new_path", "")
+            if path and new_path:
+                raw_parsed.append(("rename_file", path, new_path))
 
     if not raw_parsed:
         return None
@@ -219,10 +232,17 @@ def parse_ops(output: str, default_path: str) -> Optional[list[Op]]:
             ops.append(Op(kind="create_file", path=path, content=payload))
         elif kind == "append_file":
             ops.append(Op(kind="append_file", path=path, text=payload))
+        elif kind == "delete_file":
+            ops.append(Op(kind="delete_file", path=path))
+        elif kind == "rename_file":
+            ops.append(Op(kind="rename_file", path=path, new_path=payload))
 
-    # Emit merged edit_file ops first (before create/append), preserving path order
+    # Order: rename_file first (creates new paths), then edit_file (may target new paths),
+    # then create/append/delete last
+    rename_ops = [op for op in ops if op.kind == "rename_file"]
+    other_ops = [op for op in ops if op.kind != "rename_file"]
     edit_ops_list = [Op(kind="edit_file", path=path, edits=edits)
                      for path, edits in edit_ops_by_path.items()]
-    ops = edit_ops_list + ops  # edits before creates/appends
+    ops = rename_ops + edit_ops_list + other_ops
 
     return ops if ops else None
